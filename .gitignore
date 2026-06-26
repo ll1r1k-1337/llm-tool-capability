@@ -5,3 +5,7 @@ coverage
 .DS_Store
 .env
 .env.*
+
+# scratch / debug logs
+scratch*
+*.log.jsonl
