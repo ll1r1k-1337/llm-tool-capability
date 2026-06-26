@@ -216,6 +216,47 @@ describe("proxy server", () => {
     expect(await res.text()).not.toContain("INTERNALS");
   });
 
+  it("returns a generic message for upstream auth failures (no token echo)", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const upstream = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ error: "invalid key: Bearer sk-LEAKED12345" }), {
+          status: 401,
+        }),
+    );
+    const base = await startProxy(upstream);
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(res.status).toBe(401);
+    const text = await res.text();
+    expect(text).not.toContain("LEAKED");
+    expect(text).not.toContain("sk-");
+  });
+
+  it("scrubs credential tokens from relayed (non-auth) upstream error bodies", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const upstream = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ error: "bad request: Bearer sk-SHOULDNOTLEAK99 rejected" }),
+          { status: 400 },
+        ),
+    );
+    const base = await startProxy(upstream);
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(res.status).toBe(400);
+    const text = await res.text();
+    expect(text).not.toContain("SHOULDNOTLEAK");
+    expect(text).toContain("redacted");
+  });
+
   it("passes through legacy /v1/completions to the upstream", async () => {
     const upstream = vi.fn(async (_url: string, _init?: any) =>
       jsonResponse({ id: "cmpl-x", object: "text_completion", choices: [{ text: "hi" }] }),

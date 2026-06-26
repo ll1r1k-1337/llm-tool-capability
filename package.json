@@ -1,6 +1,6 @@
 {
   "name": "llm-tool-capability",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Drop-in OpenAI-compatible tool calling for LLMs that don't support function calling natively. Injects tools via prompt, parses tool calls from text, and runs a full agentic loop — with streaming support.",
   "keywords": [
     "openai",

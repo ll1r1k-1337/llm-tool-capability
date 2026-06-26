@@ -76,6 +76,55 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
   res.end(body);
 }
 
+/** True for auth-class statuses whose error bodies may echo our credentials. */
+function isAuthStatus(status: number): boolean {
+  return status === 401 || status === 403;
+}
+
+/** Strips credential-shaped tokens from an upstream error body before relaying. */
+function sanitizeUpstreamBody(body: string): string {
+  return body
+    .replace(/Bearer\s+[A-Za-z0-9_\-.=]+/gi, "Bearer [redacted]")
+    .replace(/\bsk-[A-Za-z0-9_-]{6,}/g, "sk-[redacted]")
+    .replace(
+      /("?(?:api[_-]?key|authorization|access[_-]?token|token|secret)"?\s*[:=]\s*"?)[A-Za-z0-9_\-.=]+/gi,
+      "$1[redacted]",
+    );
+}
+
+/**
+ * Relays an upstream error to the client: a generic message for auth-class
+ * failures (which may reflect our token and aren't client-actionable), and the
+ * sanitized upstream body otherwise (so context-length / rate-limit / validation
+ * errors stay actionable).
+ */
+function relayUpstreamError(
+  res: ServerResponse,
+  status: number,
+  body: string,
+  contentType = "application/json",
+): void {
+  if (res.headersSent) {
+    res.end();
+    return;
+  }
+  if (isAuthStatus(status)) {
+    sendJson(res, status, {
+      error: { message: "Upstream authentication failed.", type: "upstream_error" },
+    });
+    return;
+  }
+  const trimmed = body.trim();
+  if (!trimmed) {
+    sendJson(res, status, {
+      error: { message: `Upstream returned ${status}.`, type: "upstream_error" },
+    });
+    return;
+  }
+  res.writeHead(status, { "content-type": contentType });
+  res.end(sanitizeUpstreamBody(body));
+}
+
 function sendError(res: ServerResponse, status: number, message: string, type = "invalid_request_error"): void {
   if (res.headersSent) {
     res.end();
@@ -126,18 +175,9 @@ export function createProxyHandler(
       // the client needs — relay its status and body verbatim. Reserve the
       // generic 502 for unexpected failures (bugs, network errors to upstream).
       if (err instanceof UpstreamError) {
+        // Full detail (incl. any token the upstream echoed) stays server-side only.
         console.error(`[llm-tool-proxy] upstream ${err.status}: ${err.body.slice(0, 500)}`);
-        if (res.headersSent) {
-          res.end();
-          return;
-        }
-        const hasBody = err.body.trim().length > 0;
-        res.writeHead(err.status, { "content-type": "application/json" });
-        res.end(
-          hasBody
-            ? err.body
-            : JSON.stringify({ error: { message: err.message, type: "upstream_error" } }),
-        );
+        relayUpstreamError(res, err.status, err.body);
         return;
       }
       console.error("[llm-tool-proxy] request error:", err);
@@ -179,15 +219,14 @@ export function createProxyHandler(
             : {}),
         },
       });
+      const modelsCt = upstreamRes.headers.get("content-type") ?? "application/json";
       if (!upstreamRes.ok) {
         console.error(`[llm-tool-proxy] upstream /models returned ${upstreamRes.status}`);
+        relayUpstreamError(res, upstreamRes.status, await upstreamRes.text(), modelsCt);
+        return;
       }
-      // Relay the upstream response (status + body) verbatim — transparent proxy.
-      const text = await upstreamRes.text();
-      res.writeHead(upstreamRes.status, {
-        "content-type": upstreamRes.headers.get("content-type") ?? "application/json",
-      });
-      res.end(text);
+      res.writeHead(200, { "content-type": modelsCt });
+      res.end(await upstreamRes.text());
       return;
     }
 
@@ -309,10 +348,14 @@ export function createProxyHandler(
       signal: controller.signal,
     });
 
-    res.writeHead(upstreamRes.status, {
-      "content-type":
-        upstreamRes.headers.get("content-type") ?? "application/octet-stream",
-    });
+    const ptCt = upstreamRes.headers.get("content-type") ?? "application/octet-stream";
+    if (!upstreamRes.ok) {
+      console.error(`[llm-tool-proxy] upstream ${subpath} returned ${upstreamRes.status}`);
+      relayUpstreamError(res, upstreamRes.status, await upstreamRes.text(), ptCt);
+      return;
+    }
+
+    res.writeHead(upstreamRes.status, { "content-type": ptCt });
 
     const upstreamBody = upstreamRes.body;
     if (!upstreamBody) {
