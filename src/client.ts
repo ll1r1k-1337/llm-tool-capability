@@ -48,6 +48,36 @@ function textFromContent(
   return "";
 }
 
+/**
+ * Collapses a content-part array to a plain string **iff every part is text**.
+ * Many tool-less upstreams reject OpenAI's array content form (some tokenize it
+ * as 0 tokens and reject the request). Arrays with non-text parts (images, etc.)
+ * are returned unchanged so multimodal requests keep working.
+ */
+function collapseTextContent(
+  content: string | ChatCompletionContentPart[] | null | undefined,
+): string | ChatCompletionContentPart[] | null | undefined {
+  if (!Array.isArray(content) || content.length === 0) return content;
+  const allText = content.every(
+    (p) => p && p.type === "text" && typeof (p as any).text === "string",
+  );
+  if (!allText) return content;
+  return content.map((p) => (p as any).text as string).join("\n");
+}
+
+/** Returns the message with text-only array content collapsed to a string. */
+function normalizeOutboundMessage(
+  msg: ChatCompletionMessageParam,
+): ChatCompletionMessageParam {
+  if ("content" in msg && Array.isArray(msg.content)) {
+    const collapsed = collapseTextContent(msg.content);
+    if (collapsed !== msg.content) {
+      return { ...msg, content: collapsed } as ChatCompletionMessageParam;
+    }
+  }
+  return msg;
+}
+
 function renderToolCallBlock(tag: string, name: string, argsString: string): string {
   const parsedArgs = tryParseJson(argsString);
   const argsValue = parsedArgs === undefined ? argsString : parsedArgs;
@@ -131,7 +161,7 @@ export function flattenMessages(
       continue;
     }
 
-    out.push(msg);
+    out.push(normalizeOutboundMessage(msg));
   }
 
   flushResults();

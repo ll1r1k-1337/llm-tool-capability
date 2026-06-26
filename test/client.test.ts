@@ -223,6 +223,39 @@ describe("flattenMessages", () => {
     expect((flat[0] as any).content).toContain("```tool_result");
     expect((flat[0] as any).content).toContain("get_weather");
   });
+
+  it("collapses text-only array content to a string (issue #3)", () => {
+    const flat = flattenMessages(
+      [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "hello" },
+            { type: "text", text: "world" },
+          ] as any,
+        },
+      ],
+      { toolCallTag: "tool_call", toolResultTag: "tool_result" },
+    );
+    expect(flat[0]!.content).toBe("hello\nworld");
+  });
+
+  it("preserves array content that contains non-text parts (multimodal)", () => {
+    const flat = flattenMessages(
+      [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "look" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+          ] as any,
+        },
+      ],
+      { toolCallTag: "tool_call", toolResultTag: "tool_result" },
+    );
+    expect(Array.isArray(flat[0]!.content)).toBe(true);
+    expect(flat[0]!.content).toHaveLength(2);
+  });
 });
 
 describe("wrapToolSupport (streaming)", () => {
