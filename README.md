@@ -85,6 +85,12 @@ createProxyServer({
 }).listen(8787);
 ```
 
+**Endpoints:** `POST /v1/chat/completions` (with tool support) and `GET /health`.
+Every other route under the base path — `/v1/completions`, `/v1/embeddings`,
+`/v1/models`, etc. — is **transparently passed through** to the upstream
+unchanged (no tool injection; those endpoints have no tools), so the proxy is a
+full drop-in, not just a chat endpoint.
+
 > The proxy does **not** execute tools — it returns `tool_calls` to the caller,
 > exactly like OpenAI. Your client runs the tools and sends results back. For
 > server-side tool *execution*, use the agentic runner (Layer B) in code.

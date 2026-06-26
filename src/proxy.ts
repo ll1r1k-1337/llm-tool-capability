@@ -29,7 +29,7 @@ export interface ProxyOptions extends WrapOptions {
   fetch?: typeof fetch;
 }
 
-function readJsonBody(req: IncomingMessage, limitBytes: number): Promise<any> {
+function readRawBody(req: IncomingMessage, limitBytes: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -48,13 +48,7 @@ function readJsonBody(req: IncomingMessage, limitBytes: number): Promise<any> {
     req.on("end", () => {
       if (done) return;
       done = true;
-      const raw = Buffer.concat(chunks).toString("utf8");
-      if (!raw) return resolve({});
-      try {
-        resolve(JSON.parse(raw));
-      } catch {
-        reject(new Error("Invalid JSON body"));
-      }
+      resolve(Buffer.concat(chunks));
     });
     req.on("error", (err) => {
       if (!done) {
@@ -63,6 +57,16 @@ function readJsonBody(req: IncomingMessage, limitBytes: number): Promise<any> {
       }
     });
   });
+}
+
+async function readJsonBody(req: IncomingMessage, limitBytes: number): Promise<any> {
+  const raw = (await readRawBody(req, limitBytes)).toString("utf8");
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new Error("Invalid JSON body");
+  }
 }
 
 function sendJson(res: ServerResponse, status: number, payload: unknown): void {
@@ -235,7 +239,80 @@ export function createProxyHandler(
       return;
     }
 
+    // Transparent passthrough for other endpoints under basePath
+    // (e.g. /completions, /embeddings, /rerank) — forwarded to the upstream
+    // verbatim, with no tool injection (those endpoints have no tools).
+    if (path === basePath || path.startsWith(`${basePath}/`)) {
+      await passthrough(req, res, path.slice(basePath.length) || "/");
+      return;
+    }
+
     sendError(res, 404, `Not found: ${method} ${path}`, "not_found");
+  }
+
+  async function passthrough(
+    req: IncomingMessage,
+    res: ServerResponse,
+    subpath: string,
+  ): Promise<void> {
+    const base = options.upstreamBaseURL.replace(/\/+$/, "");
+    const doFetch = options.fetch ?? globalThis.fetch;
+    const method = req.method ?? "GET";
+
+    let bodyBuf: Buffer | undefined;
+    if (method !== "GET" && method !== "HEAD") {
+      try {
+        bodyBuf = await readRawBody(req, maxBodySize);
+      } catch (err) {
+        sendError(res, 400, err instanceof Error ? err.message : "Bad request");
+        return;
+      }
+    }
+
+    const controller = new AbortController();
+    res.on("close", () => controller.abort());
+
+    const headers: Record<string, string> = {
+      ...options.upstreamHeaders,
+      ...(options.upstreamApiKey
+        ? { authorization: `Bearer ${options.upstreamApiKey}` }
+        : {}),
+    };
+    const ct = req.headers["content-type"];
+    if (typeof ct === "string") headers["content-type"] = ct;
+    const accept = req.headers["accept"];
+    if (typeof accept === "string") headers["accept"] = accept;
+
+    const upstreamRes = await doFetch(`${base}${subpath}`, {
+      method,
+      headers,
+      body: bodyBuf && bodyBuf.length > 0 ? bodyBuf : undefined,
+      signal: controller.signal,
+    });
+
+    res.writeHead(upstreamRes.status, {
+      "content-type":
+        upstreamRes.headers.get("content-type") ?? "application/octet-stream",
+    });
+
+    const upstreamBody = upstreamRes.body;
+    if (!upstreamBody) {
+      res.end();
+      return;
+    }
+    const reader = upstreamBody.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value && !res.write(Buffer.from(value))) {
+          await new Promise<void>((resolve) => res.once("drain", resolve));
+        }
+      }
+    } finally {
+      reader.releaseLock();
+      if (!res.writableEnded) res.end();
+    }
   }
 }
 

@@ -194,6 +194,21 @@ describe("proxy server", () => {
     expect(await res.text()).not.toContain("SECRET");
   });
 
+  it("passes through legacy /v1/completions to the upstream", async () => {
+    const upstream = vi.fn(async (_url: string, _init?: any) =>
+      jsonResponse({ id: "cmpl-x", object: "text_completion", choices: [{ text: "hi" }] }),
+    );
+    const base = await startProxy(upstream);
+    const res = await fetch(`${base}/v1/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", prompt: "hi" }),
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as any).object).toBe("text_completion");
+    expect(String(upstream.mock.calls[0]![0])).toBe("http://upstream/v1/completions");
+  });
+
   it("rejects oversized request bodies", async () => {
     const base = await startProxy(vi.fn(), { maxBodySize: 200 });
     const res = await fetch(`${base}/v1/chat/completions`, {
