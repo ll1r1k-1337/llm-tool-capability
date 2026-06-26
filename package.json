@@ -15,6 +15,14 @@
     "lm-studio"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ll1r1k-1337/llm-tool-capability.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ll1r1k-1337/llm-tool-capability/issues"
+  },
+  "homepage": "https://github.com/ll1r1k-1337/llm-tool-capability#readme",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -42,7 +50,7 @@
     }
   },
   "bin": {
-    "llm-tool-proxy": "./dist/cli.js"
+    "llm-tool-proxy": "dist/cli.js"
   },
   "files": [
     "dist"
