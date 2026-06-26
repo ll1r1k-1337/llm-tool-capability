@@ -1,10 +1,107 @@
 import http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createHash, timingSafeEqual } from "node:crypto";
-import type { ChatCompletion, ChatCompletionChunk, ToolCapableClient } from "./types.js";
+import fs from "node:fs";
+import path from "node:path";
+import type {
+  ChatClientLike,
+  ChatCompletion,
+  ChatCompletionChunk,
+  ToolCapableClient,
+} from "./types.js";
 import { wrapToolSupport, type WrapOptions } from "./client.js";
 import { createFetchClient } from "./upstream.js";
 import { UpstreamError } from "./errors.js";
+
+/** Appends one JSON line per event to a debug log file (opt-in via logFile). */
+type LogFn = (entry: Record<string, unknown>) => void;
+
+/** Wraps an upstream client so the (post-transform) outbound body is logged. */
+function withUpstreamLogging(client: ChatClientLike, log: LogFn): ChatClientLike {
+  return {
+    chat: {
+      completions: {
+        create(body: any, opts?: any) {
+          log({ type: "upstream_request", stream: !!body?.stream, body });
+          return client.chat.completions.create(body, opts);
+        },
+      },
+    },
+  };
+}
+
+const DEFAULT_MAX_LOG_BYTES = 100 * 1024 * 1024;
+const LOG_BACKPRESSURE_BYTES = 8 * 1024 * 1024;
+
+interface FileLogger {
+  log: LogFn;
+  close: () => void;
+}
+
+/**
+ * Bounded JSON-lines file logger for the proxy: caps total size, drops entries
+ * under write backpressure (to bound memory), stops on stream error, and never
+ * throws into the request path.
+ */
+function createFileLogger(filePath: string, maxBytes: number): FileLogger {
+  try {
+    fs.mkdirSync(path.dirname(path.resolve(filePath)), { recursive: true });
+  } catch {
+    // best effort; createWriteStream's 'error' handler reports a bad path
+  }
+  const stream = fs.createWriteStream(filePath, { flags: "a" });
+  let errored = false;
+  let written = 0;
+  let warnedCap = false;
+  let warnedDrop = false;
+
+  stream.on("error", (err) => {
+    errored = true;
+    console.error("[llm-tool-proxy] log file write error:", err);
+  });
+
+  const log: LogFn = (entry) => {
+    if (errored) return;
+    if (written >= maxBytes) {
+      if (!warnedCap) {
+        warnedCap = true;
+        console.warn(
+          `[llm-tool-proxy] log file reached ${maxBytes} bytes; further logging disabled.`,
+        );
+      }
+      return;
+    }
+    if (stream.writableLength > LOG_BACKPRESSURE_BYTES) {
+      if (!warnedDrop) {
+        warnedDrop = true;
+        console.warn("[llm-tool-proxy] log write backpressure; dropping entries.");
+      }
+      return;
+    }
+    let line: string;
+    try {
+      line = JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n";
+    } catch (err) {
+      console.warn(
+        "[llm-tool-proxy] failed to serialize log entry:",
+        err instanceof Error ? err.message : String(err),
+      );
+      return;
+    }
+    written += Buffer.byteLength(line);
+    stream.write(line);
+  };
+
+  const close = () => {
+    try {
+      stream.end();
+    } catch {
+      // already closed
+    }
+  };
+
+  return { log, close };
+}
 
 const DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024;
 
@@ -26,6 +123,15 @@ export interface ProxyOptions extends WrapOptions {
   cors?: boolean;
   /** Max accepted request body size in bytes. Default: 10 MiB. */
   maxBodySize?: number;
+  /**
+   * If set, append a JSON-lines debug log to this file: the request received
+   * from the client, the (transformed) request sent upstream, and the response.
+   * Request/response bodies are logged in full; headers (and thus tokens) are
+   * never logged. Verbose — intended for debugging only.
+   */
+  logFile?: string;
+  /** Stop logging once the log file reaches this many bytes. Default: 100 MiB. */
+  maxLogBytes?: number;
   /** Custom fetch implementation. */
   fetch?: typeof fetch;
 }
@@ -133,23 +239,35 @@ function sendError(res: ServerResponse, status: number, message: string, type = 
   sendJson(res, status, { error: { message, type } });
 }
 
+/** A proxy request handler with a `closeLog()` to flush/close the debug log. */
+export interface ProxyHandler {
+  (req: IncomingMessage, res: ServerResponse): void;
+  /** Flush and close the debug log stream (no-op if logging is disabled). */
+  closeLog(): void;
+}
+
 /**
  * Builds a Node HTTP request handler that exposes an OpenAI-compatible
  * `chat/completions` endpoint and transparently adds tool-calling support on
  * top of a tool-less upstream model. Point any OpenAI client's `baseURL` at it.
  */
-export function createProxyHandler(
-  options: ProxyOptions,
-): (req: IncomingMessage, res: ServerResponse) => void {
+export function createProxyHandler(options: ProxyOptions): ProxyHandler {
   const basePath = (options.basePath ?? "/v1").replace(/\/+$/, "");
   const cors = options.cors ?? false;
   const maxBodySize = options.maxBodySize ?? DEFAULT_MAX_BODY_BYTES;
-  const upstream = createFetchClient({
+
+  const logger = options.logFile
+    ? createFileLogger(options.logFile, options.maxLogBytes ?? DEFAULT_MAX_LOG_BYTES)
+    : null;
+  const log: LogFn = (entry) => logger?.log(entry);
+
+  const rawUpstream = createFetchClient({
     baseURL: options.upstreamBaseURL,
     apiKey: options.upstreamApiKey,
     headers: options.upstreamHeaders,
     fetch: options.fetch,
   });
+  const upstream = logger ? withUpstreamLogging(rawUpstream, log) : rawUpstream;
   const wrapped: ToolCapableClient = wrapToolSupport(upstream, options);
 
   const setCors = (res: ServerResponse) => {
@@ -169,7 +287,7 @@ export function createProxyHandler(
     return timingSafeEqual(a, b);
   };
 
-  return (req, res) => {
+  const handler: ProxyHandler = (req, res) => {
     void handle(req, res).catch((err) => {
       // An upstream API error (non-2xx with a body) is the legitimate response
       // the client needs — relay its status and body verbatim. Reserve the
@@ -177,13 +295,17 @@ export function createProxyHandler(
       if (err instanceof UpstreamError) {
         // Full detail (incl. any token the upstream echoed) stays server-side only.
         console.error(`[llm-tool-proxy] upstream ${err.status}: ${err.body.slice(0, 500)}`);
+        log({ type: "upstream_error", status: err.status, body: sanitizeUpstreamBody(err.body) });
         relayUpstreamError(res, err.status, err.body);
         return;
       }
       console.error("[llm-tool-proxy] request error:", err);
+      log({ type: "error", message: err instanceof Error ? err.message : String(err) });
       sendError(res, 502, "Proxy request failed; see server logs.", "api_error");
     });
   };
+  handler.closeLog = () => logger?.close();
+  return handler;
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     setCors(res);
@@ -243,6 +365,8 @@ export function createProxyHandler(
         return;
       }
 
+      log({ type: "client_request", method, path, body });
+
       const controller = new AbortController();
       res.on("close", () => controller.abort());
 
@@ -287,12 +411,14 @@ export function createProxyHandler(
             res.end();
           }
         }
+        log({ type: "response", path, status: 200, stream: true });
         return;
       }
 
       const result = (await wrapped.chat.completions.create(body, {
         signal: controller.signal,
       })) as ChatCompletion;
+      log({ type: "response", path, status: 200, body: result });
       sendJson(res, 200, result);
       return;
     }
@@ -325,6 +451,17 @@ export function createProxyHandler(
         sendError(res, 400, err instanceof Error ? err.message : "Bad request");
         return;
       }
+    }
+
+    if (logger) {
+      const raw = bodyBuf ? bodyBuf.toString("utf8") : "";
+      let parsed: unknown = raw;
+      try {
+        if (raw) parsed = JSON.parse(raw);
+      } catch {
+        /* keep raw string */
+      }
+      log({ type: "client_request", method, path: subpath, passthrough: true, body: parsed });
     }
 
     const controller = new AbortController();
@@ -378,7 +515,16 @@ export function createProxyHandler(
   }
 }
 
+/** An http.Server that also flushes/closes the proxy's debug log on `closeLog()`. */
+export interface ProxyServer extends http.Server {
+  /** Flush and close the debug log stream (no-op if logging is disabled). */
+  closeLog(): void;
+}
+
 /** Creates (but does not start) an HTTP server wrapping {@link createProxyHandler}. */
-export function createProxyServer(options: ProxyOptions): http.Server {
-  return http.createServer(createProxyHandler(options));
+export function createProxyServer(options: ProxyOptions): ProxyServer {
+  const handler = createProxyHandler(options);
+  const server = http.createServer(handler) as ProxyServer;
+  server.closeLog = handler.closeLog;
+  return server;
 }

@@ -44,6 +44,12 @@ Options:
   --system-injection <m>  'merge' (default) or 'prepend'
   --cors                  Enable permissive (wildcard) CORS headers (off by default)
   --max-body-size <bytes> Max request body size (default: 10485760 = 10 MiB)
+  --log-file <path>       Append a JSON-lines debug log (client request, the
+                          transformed upstream request, and the response) to
+                          <path> [env: PROXY_LOG_FILE]. Verbose; headers/tokens
+                          are never logged.
+  --max-log-size <bytes>  Stop logging once the log file hits this size
+                          (default: 104857600 = 100 MiB)
   -h, --help              Show this help
 
 Then point any OpenAI client at  http://<host>:<port>/v1  and pass tools as usual.`;
@@ -80,6 +86,8 @@ function main(): void {
     maxBodySize: args["max-body-size"]
       ? Number(args["max-body-size"])
       : undefined,
+    logFile: (args["log-file"] as string) || process.env.PROXY_LOG_FILE,
+    maxLogBytes: args["max-log-size"] ? Number(args["max-log-size"]) : undefined,
   };
 
   const server = createProxyServer(options);
@@ -87,9 +95,11 @@ function main(): void {
     console.log(`llm-tool-proxy listening on http://${host}:${port}${options.basePath}`);
     console.log(`  → upstream: ${upstreamBaseURL}`);
     if (options.apiKey) console.log("  → client auth: required");
+    if (options.logFile) console.log(`  → debug log: ${options.logFile}`);
   });
 
   const shutdown = () => {
+    server.closeLog();
     server.close(() => process.exit(0));
   };
   process.on("SIGINT", shutdown);

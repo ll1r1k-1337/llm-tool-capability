@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import type { AddressInfo } from "node:net";
-import type { Server } from "node:http";
-import { createProxyServer } from "../src/proxy.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createProxyServer, type ProxyServer } from "../src/proxy.js";
 import type { ChatCompletionTool } from "../src/index.js";
 import { makeCompletion } from "./helpers.js";
 
@@ -34,7 +36,7 @@ function sseResponse(events: string[]): Response {
   return new Response(body, { status: 200 });
 }
 
-function listen(server: Server): Promise<string> {
+function listen(server: ProxyServer): Promise<string> {
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => {
       const { port } = server.address() as AddressInfo;
@@ -43,9 +45,12 @@ function listen(server: Server): Promise<string> {
   });
 }
 
-const servers: Server[] = [];
+const servers: ProxyServer[] = [];
 afterEach(() => {
-  for (const s of servers.splice(0)) s.close();
+  for (const s of servers.splice(0)) {
+    s.closeLog();
+    s.close();
+  }
 });
 
 async function startProxy(fetchMock: any, extra: Record<string, unknown> = {}) {
@@ -270,6 +275,102 @@ describe("proxy server", () => {
     expect(res.status).toBe(200);
     expect(((await res.json()) as any).object).toBe("text_completion");
     expect(String(upstream.mock.calls[0]![0])).toBe("http://upstream/v1/completions");
+  });
+
+  it("writes a JSON-lines debug log of client and upstream requests", async () => {
+    const logPath = path.join(
+      os.tmpdir(),
+      `lcap-log-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`,
+    );
+    const upstream = vi.fn(async (_url: string, _init?: any) =>
+      jsonResponse(makeCompletion(toolCallText)),
+    );
+    const base = await startProxy(upstream, { logFile: logPath });
+    await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "m",
+        messages: [{ role: "user", content: "weather?" }],
+        tools: [weatherTool],
+      }),
+    });
+
+    // Flush deterministically by closing the log stream, then poll as a safety net.
+    servers[servers.length - 1]!.closeLog();
+    let content = "";
+    for (let i = 0; i < 100 && !content.includes('"response"'); i++) {
+      try {
+        content = fs.readFileSync(logPath, "utf8");
+      } catch {
+        /* not created yet */
+      }
+      if (content.includes('"response"')) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    const lines = content
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
+    const byType = (t: string) => lines.find((l) => l.type === t);
+
+    expect(lines.map((l) => l.type)).toEqual(
+      expect.arrayContaining(["client_request", "upstream_request", "response"]),
+    );
+    // Client request keeps the original user message + tools.
+    expect(byType("client_request").body.messages[0].role).toBe("user");
+    expect(byType("client_request").body.tools).toHaveLength(1);
+    // Upstream request is transformed: tools injected as a system message, stripped from params.
+    expect(byType("upstream_request").body.messages[0].role).toBe("system");
+    expect(byType("upstream_request").body.tools).toBeUndefined();
+
+    try {
+      fs.rmSync(logPath, { force: true });
+    } catch {
+      /* stream may still hold the file open on Windows */
+    }
+  });
+
+  it("sanitizes upstream error bodies written to the log file", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const logPath = path.join(
+      os.tmpdir(),
+      `lcap-log-sec-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`,
+    );
+    const upstream = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ error: "invalid: Bearer sk-LOGLEAK123" }), {
+          status: 401,
+        }),
+    );
+    const base = await startProxy(upstream, { logFile: logPath });
+    await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }),
+    });
+
+    servers[servers.length - 1]!.closeLog();
+    let content = "";
+    for (let i = 0; i < 100 && !content.includes("upstream_error"); i++) {
+      try {
+        content = fs.readFileSync(logPath, "utf8");
+      } catch {
+        /* not created yet */
+      }
+      if (content.includes("upstream_error")) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(content).toContain("upstream_error");
+    expect(content).not.toContain("LOGLEAK");
+
+    try {
+      fs.rmSync(logPath, { force: true });
+    } catch {
+      /* stream may still hold the file open */
+    }
   });
 
   it("rejects oversized request bodies", async () => {

@@ -66,8 +66,12 @@ tool calls back, and streams via SSE — identical wire format to OpenAI.
 **CLI flags:** `--upstream <url>` (required), `--upstream-key`, `--port`,
 `--host`, `--api-key` (require a bearer token from clients), `--base-path`,
 `--tag`, `--no-examples`, `--system-injection merge|prepend`, `--cors` (enable
-wildcard CORS — off by default), `--max-body-size <bytes>` (default 10 MiB).
-Key flags have env equivalents (`UPSTREAM_BASE_URL`, `PORT`, `PROXY_API_KEY`, …).
+wildcard CORS — off by default), `--max-body-size <bytes>` (default 10 MiB),
+`--log-file <path>` (append a JSON-lines debug log of the client request, the
+transformed upstream request, and the response — verbose; bodies are logged but
+headers/tokens never are), `--max-log-size <bytes>` (cap the log file; default
+100 MiB). Key flags have env equivalents (`UPSTREAM_BASE_URL`, `PORT`,
+`PROXY_API_KEY`, `PROXY_LOG_FILE`, …).
 
 > **Security:** the proxy binds to `127.0.0.1` and disables CORS by default.
 > Before exposing it beyond localhost (`--host 0.0.0.0`), set `--api-key` so
