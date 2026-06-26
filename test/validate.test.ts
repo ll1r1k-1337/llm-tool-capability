@@ -67,4 +67,39 @@ describe("ToolValidator", () => {
     expect(v.hasTool("get_weather")).toBe(true);
     expect(v.hasTool("nope")).toBe(false);
   });
+
+  it("enforces validation even when two tools share a $id", () => {
+    const dup = new ToolValidator([
+      {
+        type: "function",
+        function: {
+          name: "a",
+          parameters: {
+            $id: "http://example.com/shared",
+            type: "object",
+            properties: { q: { type: "string" } },
+            required: ["q"],
+            additionalProperties: false,
+          },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "b",
+          parameters: {
+            $id: "http://example.com/shared",
+            type: "object",
+            properties: { z: { type: "number" } },
+            required: ["z"],
+            additionalProperties: false,
+          },
+        },
+      },
+    ]);
+    expect(dup.validate("a", "{}").valid).toBe(false);
+    // Would be true (validator silently dropped) without the $id fix:
+    expect(dup.validate("b", "{}").valid).toBe(false);
+    expect(dup.validate("b", '{"z":1}').valid).toBe(true);
+  });
 });

@@ -274,9 +274,26 @@ The internals are exported for custom pipelines: `buildToolPrompt`,
   with `includeExamples: true` and a short, clear tool list.
 - Only `function` tools are supported (matching OpenAI's function tools); the
   newer `custom` tools are out of scope.
-- **Streaming processes the first choice only.** `n > 1` works for non-streaming
-  requests (each choice is parsed independently) but not while streaming — which
-  is fine in practice, since OpenAI forbids `n > 1` together with `tools`.
+- **Streaming processes the first choice only.** `n > 1` is rejected together
+  with `tools` (prompted tool calling parses a single completion; OpenAI forbids
+  `n > 1` with tools too). Non-streaming `n > 1` without tools passes through.
+
+## Security
+
+- **Tool definitions are trusted input.** Each tool's JSON Schema (including any
+  `pattern`) is compiled and executed by `ajv` during argument validation in the
+  runner. Don't pass untrusted/user-authored tool schemas without vetting them —
+  a malicious `pattern` could cause catastrophic regex backtracking (ReDoS). Tool
+  names/descriptions are sanitized before they reach the prompt.
+- **Parser limits.** The streaming parser caps its internal buffer
+  (`maxBufferBytes`, default 1 MiB) and scans for the closing fence in linear
+  time; JSON "repair" is skipped on very large inputs — both bound CPU/memory on
+  malformed or unterminated model output.
+- **Proxy.** Binds to `127.0.0.1` with CORS off by default; set `--api-key`
+  before exposing it. Client request bodies are size-capped; upstream API errors
+  are relayed but credential-shaped tokens are stripped first (and `401/403`
+  bodies are replaced with a generic message); the debug log never records
+  headers/tokens and is size-bounded.
 
 ## License
 

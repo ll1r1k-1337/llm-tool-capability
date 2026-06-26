@@ -141,6 +141,18 @@ describe("tryParseJson", () => {
   it("returns undefined for hopeless input", () => {
     expect(tryParseJson("not json at all {")).toBeUndefined();
   });
+
+  it("skips regex repair on very large malformed input (ReDoS guard)", () => {
+    const big = "{" + "/*".repeat(200_000); // >256 KB, malformed, many '/*'
+    const t0 = Date.now();
+    expect(tryParseJson(big)).toBeUndefined();
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
+  it("still parses large VALID json (guard only affects repair)", () => {
+    const big = JSON.stringify({ a: "y".repeat(300_000) });
+    expect(tryParseJson(big)).toEqual({ a: "y".repeat(300_000) });
+  });
 });
 
 describe("randomToolCallId", () => {

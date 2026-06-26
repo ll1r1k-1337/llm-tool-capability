@@ -373,6 +373,37 @@ describe("proxy server", () => {
     }
   });
 
+  it("rejects a non-boolean stream parameter", async () => {
+    const base = await startProxy(vi.fn());
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", messages: [], stream: "true" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("fully redacts JWT/base64 tokens (with / and +) from relayed errors", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const upstream = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ error: "bad: Bearer eyJhbGc.AAA/BBB+CCC end" }), {
+          status: 400,
+        }),
+    );
+    const base = await startProxy(upstream);
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(res.status).toBe(400);
+    const text = await res.text();
+    expect(text).not.toContain("AAA");
+    expect(text).not.toContain("BBB");
+    expect(text).not.toContain("CCC");
+  });
+
   it("rejects oversized request bodies", async () => {
     const base = await startProxy(vi.fn(), { maxBodySize: 200 });
     const res = await fetch(`${base}/v1/chat/completions`, {

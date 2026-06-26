@@ -187,13 +187,18 @@ function isAuthStatus(status: number): boolean {
   return status === 401 || status === 403;
 }
 
-/** Strips credential-shaped tokens from an upstream error body before relaying. */
+/**
+ * Strips credential-shaped tokens from an upstream error body before relaying.
+ * Token bodies are matched up to a whitespace/quote/structural boundary (not a
+ * fixed character class) so JWT/base64 tokens containing `/`, `+`, `.` are
+ * redacted in full rather than truncated.
+ */
 function sanitizeUpstreamBody(body: string): string {
   return body
-    .replace(/Bearer\s+[A-Za-z0-9_\-.=]+/gi, "Bearer [redacted]")
-    .replace(/\bsk-[A-Za-z0-9_-]{6,}/g, "sk-[redacted]")
+    .replace(/Bearer\s+[^\s"']+/gi, "Bearer [redacted]")
+    .replace(/\bsk-[^\s"',}]+/g, "sk-[redacted]")
     .replace(
-      /("?(?:api[_-]?key|authorization|access[_-]?token|token|secret)"?\s*[:=]\s*"?)[A-Za-z0-9_\-.=]+/gi,
+      /("?(?:api[_-]?key|authorization|access[_-]?token|token|secret)"?\s*[:=]\s*"?)[^\s"',}]+/gi,
       "$1[redacted]",
     );
 }
@@ -364,13 +369,17 @@ export function createProxyHandler(options: ProxyOptions): ProxyHandler {
         sendError(res, 400, "Request must include a 'model' and 'messages'.");
         return;
       }
+      if (body.stream !== undefined && typeof body.stream !== "boolean") {
+        sendError(res, 400, "'stream' must be a boolean.");
+        return;
+      }
 
       log({ type: "client_request", method, path, body });
 
       const controller = new AbortController();
       res.on("close", () => controller.abort());
 
-      if (body.stream) {
+      if (body.stream === true) {
         const stream = (await wrapped.chat.completions.create(body, {
           signal: controller.signal,
         })) as unknown as AsyncIterable<ChatCompletionChunk>;

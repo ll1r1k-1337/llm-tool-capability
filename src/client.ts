@@ -20,6 +20,7 @@ import {
 } from "./prompt.js";
 import { parseToolCalls, tryParseJson } from "./parser.js";
 import { ToolCallStreamParser } from "./stream-parser.js";
+import { ToolCapabilityError } from "./errors.js";
 
 export interface WrapOptions extends PromptOptions {
   /** Generates the `id` for parsed tool calls (e.g. for deterministic tests). */
@@ -43,7 +44,7 @@ function textFromContent(
     return content
       .filter((p) => p && p.type === "text" && typeof (p as any).text === "string")
       .map((p) => (p as any).text as string)
-      .join("");
+      .join("\n");
   }
   return "";
 }
@@ -110,6 +111,14 @@ export function flattenMessages(
   const out: ChatCompletionMessageParam[] = [];
   const idToName = new Map<string, string>();
   let pendingResults: string[] = [];
+
+  // Pre-pass: map every tool_call id -> name first, so a tool result that
+  // appears before its assistant message still renders the real tool name.
+  for (const msg of messages) {
+    if (msg.role === "assistant" && msg.tool_calls) {
+      for (const tc of msg.tool_calls) idToName.set(tc.id, tc.function.name);
+    }
+  }
 
   const flushResults = () => {
     if (pendingResults.length > 0) {
@@ -321,6 +330,14 @@ export function wrapToolSupport(
     let outMessages = flattenMessages(messages, { toolCallTag, toolResultTag });
 
     const useTools = !!tools && tools.length > 0 && tool_choice !== "none";
+    if (useTools) {
+      // Prompted tool calling parses a single completion; n>1 would silently
+      // drop the alternatives (and OpenAI forbids n>1 with tools anyway).
+      const n = (rest as { n?: unknown }).n;
+      if (typeof n === "number" && n > 1) {
+        throw new ToolCapabilityError("n > 1 is not supported together with tools.");
+      }
+    }
     if (useTools) {
       const instruction =
         buildToolPrompt(tools!, promptOptions) +

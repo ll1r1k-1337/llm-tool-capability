@@ -38,9 +38,14 @@ export class ToolValidator {
       const { name, parameters } = tool.function;
       this.known.add(name);
       if (parameters && typeof parameters === "object") {
+        // Strip $id/$ref-ish identity keys so two tools that reuse the same $id
+        // don't collide in ajv's registry (which would silently drop the second
+        // validator and let that tool validate trivially).
+        const schema: Record<string, unknown> = { ...(parameters as object) };
+        delete schema.$id;
         try {
-          this.validators.set(name, this.ajv.compile(parameters));
-        } catch (err) {
+          this.validators.set(name, this.ajv.compile(schema));
+        } catch {
           // An un-compilable schema shouldn't break the whole runner; treat the
           // tool as "no schema" (validates trivially) rather than throwing here.
           this.validators.delete(name);

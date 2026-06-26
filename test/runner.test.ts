@@ -142,6 +142,45 @@ describe("createToolRunner.run", () => {
     );
   });
 
+  it("forwards the abort signal to the underlying client", async () => {
+    const seen: any[] = [];
+    const client = {
+      chat: {
+        completions: {
+          create: async (_body: any, opts: any) => {
+            seen.push(opts);
+            return {
+              id: "x",
+              object: "chat.completion",
+              created: 0,
+              model: "m",
+              choices: [
+                {
+                  index: 0,
+                  message: { role: "assistant", content: "done", refusal: null },
+                  finish_reason: "stop",
+                  logprobs: null,
+                },
+              ],
+            };
+          },
+        },
+      },
+    };
+    const ac = new AbortController();
+    const runner = createToolRunner(client as any, { tools: [weather] });
+    await runner.run({ model: "m", messages: ask, signal: ac.signal });
+    expect(seen[0]?.signal).toBe(ac.signal);
+  });
+
+  it("rejects n>1 together with tools", async () => {
+    const client = mockClient(["unused"]);
+    const runner = createToolRunner(client, { tools: [weather] });
+    await expect(
+      runner.run({ model: "m", messages: ask, n: 2 } as any),
+    ).rejects.toThrow(/n > 1/);
+  });
+
   it("disables schema validation when validate:false", async () => {
     const client = mockClient([call("get_weather", {}), "done"]);
     const runner = createToolRunner(client, { tools: [weather], validate: false });

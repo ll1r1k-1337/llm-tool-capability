@@ -89,6 +89,8 @@ export interface RunParams {
   model: string;
   messages: ChatCompletionMessageParam[];
   tool_choice?: ChatCompletionToolChoiceOption;
+  /** Abort signal applied to every underlying request in the loop. */
+  signal?: AbortSignal;
   /** Any other provider params (temperature, top_p, stop, …) are forwarded. */
   [key: string]: unknown;
 }
@@ -224,16 +226,20 @@ export function createToolRunner(
   async function run(params: RunParams): Promise<RunResult> {
     const messages: ChatCompletionMessageParam[] = [...params.messages];
     const toolExecutions: ToolExecution[] = [];
-    const { messages: _ignored, tool_choice, ...restParams } = params;
+    const { messages: _ignored, tool_choice, signal, ...restParams } = params;
+    const reqOpts = signal ? { signal } : undefined;
 
     for (let iteration = 1; iteration <= maxIterations; iteration++) {
-      const res = (await wrapped.chat.completions.create({
-        ...restParams,
-        messages,
-        tools: schemaTools,
-        ...(tool_choice !== undefined ? { tool_choice } : {}),
-        stream: false,
-      })) as ChatCompletion;
+      const res = (await wrapped.chat.completions.create(
+        {
+          ...restParams,
+          messages,
+          tools: schemaTools,
+          ...(tool_choice !== undefined ? { tool_choice } : {}),
+          stream: false,
+        },
+        reqOpts,
+      )) as ChatCompletion;
 
       if (!res.choices || res.choices.length === 0) {
         throw new ToolCapabilityError(
@@ -289,16 +295,20 @@ export function createToolRunner(
 
   async function* runStream(params: RunParams): AsyncIterable<RunnerEvent> {
     const messages: ChatCompletionMessageParam[] = [...params.messages];
-    const { messages: _ignored, tool_choice, ...restParams } = params;
+    const { messages: _ignored, tool_choice, signal, ...restParams } = params;
+    const reqOpts = signal ? { signal } : undefined;
 
     for (let iteration = 1; iteration <= maxIterations; iteration++) {
-      const stream = (await wrapped.chat.completions.create({
-        ...restParams,
-        messages,
-        tools: schemaTools,
-        ...(tool_choice !== undefined ? { tool_choice } : {}),
-        stream: true,
-      })) as AsyncIterable<ChatCompletionChunk>;
+      const stream = (await wrapped.chat.completions.create(
+        {
+          ...restParams,
+          messages,
+          tools: schemaTools,
+          ...(tool_choice !== undefined ? { tool_choice } : {}),
+          stream: true,
+        },
+        reqOpts,
+      )) as AsyncIterable<ChatCompletionChunk>;
 
       let text = "";
       const acc = new Map<number, ChatCompletionMessageToolCall>();

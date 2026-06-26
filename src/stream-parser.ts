@@ -7,9 +7,17 @@ export interface StreamParserOptions {
   toolCallTag?: string;
   /** Generates the `id` for the Nth (global) streamed tool call. */
   generateId?: (index: number) => string;
+  /**
+   * Max bytes buffered while holding a partial fence / tool block. If exceeded,
+   * the buffer is flushed as plain text and parsing resumes — this bounds memory
+   * and CPU on malformed or unterminated input. Default: 1 MiB.
+   */
+  maxBufferBytes?: number;
 }
 
 type State = "text" | "in_tool";
+
+const DEFAULT_MAX_BUFFER = 1024 * 1024;
 
 /**
  * Incrementally converts a stream of raw text deltas into OpenAI-shaped chunk
@@ -17,10 +25,16 @@ type State = "text" | "in_tool";
  * is buffered until its closing fence, then emitted atomically as a complete
  * `tool_calls` delta (id + name + full arguments string). Emitting the
  * arguments in one piece avoids surfacing partial/invalid JSON mid-stream.
+ *
+ * Closing-fence scanning is offset-tracked (each delta only re-scans the new
+ * tail plus a small overlap), so total work is linear in the stream length, and
+ * the buffer is size-capped to bound memory on unterminated/oversized blocks.
  */
 export class ToolCallStreamParser {
   private readonly tag: string;
   private readonly generateId: (index: number) => string;
+  private readonly maxBuffer: number;
+  private readonly openRe: RegExp;
 
   private buf = "";
   private state: State = "text";
@@ -28,10 +42,16 @@ export class ToolCallStreamParser {
   private openTicks = 3;
   private nextIndex = 0;
   private _toolCallCount = 0;
+  private closeRe: RegExp | null = null;
+  private toolScanFrom = 0;
 
   constructor(options: StreamParserOptions = {}) {
     this.tag = (options.toolCallTag ?? DEFAULT_TOOL_CALL_TAG).toLowerCase();
     this.generateId = options.generateId ?? randomToolCallId;
+    this.maxBuffer = options.maxBufferBytes ?? DEFAULT_MAX_BUFFER;
+    this.openRe = new RegExp(
+      `^[ \\t]*(\`{3,})[ \\t]*${escapeRegExp(this.tag)}(?![\\w-])[^\\n]*\\r?\\n`,
+    );
   }
 
   get toolCallCount(): number {
@@ -60,6 +80,13 @@ export class ToolCallStreamParser {
     return out;
   }
 
+  /** Flushes the whole buffer as plain text (overflow / give-up path). */
+  private flushBufAsText(out: ChatCompletionChunkDelta[]): void {
+    if (this.buf.length > 0) out.push({ content: this.buf });
+    this.buf = "";
+    this.atLineStart = false;
+  }
+
   // --- TEXT state ---------------------------------------------------------
 
   private stepText(out: ChatCompletionChunkDelta[], final: boolean): boolean {
@@ -72,15 +99,18 @@ export class ToolCallStreamParser {
         this.buf = this.buf.slice(open);
         this.state = "in_tool";
         this.atLineStart = true;
+        this.closeRe = new RegExp(
+          `(^|\\n)[ \\t]*\`{${this.openTicks},}[ \\t]*\\r?\\n`,
+          "g",
+        );
+        this.toolScanFrom = 0;
         return true;
       }
       if (open === -1) {
-        // Viable but incomplete opening fence: hold unless the stream ended.
-        if (!final) return false;
-        // On flush, an incomplete fence is just leftover text — emit it.
-        out.push({ content: this.buf });
-        this.buf = "";
-        this.atLineStart = false;
+        // Viable but incomplete opening fence: hold unless the stream ended or
+        // the buffer grew past the cap (then treat it as ordinary text).
+        if (!final && this.buf.length <= this.maxBuffer) return false;
+        this.flushBufAsText(out);
         return false;
       }
       // open === 0 -> not a fence; fall through to prose handling.
@@ -89,14 +119,15 @@ export class ToolCallStreamParser {
     const nl = this.buf.indexOf("\n");
     if (nl === -1) {
       // No newline yet: the trailing text is the current (partial) line.
-      if (this.atLineStart && this.isOpenFenceViablePrefix(this.buf)) {
+      if (
+        this.atLineStart &&
+        this.buf.length <= this.maxBuffer &&
+        this.isOpenFenceViablePrefix(this.buf)
+      ) {
         // Could still become an opening fence — hold for more input.
         if (!final) return false;
       }
-      if (this.buf.length === 0) return false;
-      out.push({ content: this.buf });
-      this.buf = "";
-      this.atLineStart = false;
+      this.flushBufAsText(out);
       return false;
     }
 
@@ -111,13 +142,15 @@ export class ToolCallStreamParser {
   // --- IN_TOOL state ------------------------------------------------------
 
   private stepTool(out: ChatCompletionChunkDelta[], final: boolean): boolean {
-    const close = this.matchCloseFence(this.buf, this.openTicks);
+    const close = this.matchCloseFence();
     if (close) {
       const inner = this.buf.slice(0, close.start);
       this.emitToolCalls(inner, out);
       this.buf = this.buf.slice(close.end);
       this.state = "text";
       this.atLineStart = true;
+      this.closeRe = null;
+      this.toolScanFrom = 0;
       return true;
     }
     if (final) {
@@ -130,6 +163,16 @@ export class ToolCallStreamParser {
       this.emitToolCalls(inner, out);
       this.buf = "";
       this.state = "text";
+      this.closeRe = null;
+      this.toolScanFrom = 0;
+      return false;
+    }
+    // Oversized unterminated block: give up and emit it as text to bound memory.
+    if (this.buf.length > this.maxBuffer) {
+      this.flushBufAsText(out);
+      this.state = "text";
+      this.closeRe = null;
+      this.toolScanFrom = 0;
       return false;
     }
     // Wait for the closing fence.
@@ -166,10 +209,7 @@ export class ToolCallStreamParser {
    * is a viable but incomplete prefix of one, or 0 if it cannot be one.
    */
   private matchOpenFence(text: string): number {
-    const re = new RegExp(
-      `^[ \\t]*(\`{3,})[ \\t]*${escapeRegExp(this.tag)}(?![\\w-])[^\\n]*\\r?\\n`,
-    );
-    const m = re.exec(text);
+    const m = this.openRe.exec(text);
     if (m) {
       this.openTicks = m[1]!.length;
       return m[0].length;
@@ -202,16 +242,25 @@ export class ToolCallStreamParser {
   }
 
   /**
-   * Finds a closing fence (>= `ticks` backticks alone on a line) terminated by
-   * a newline. Returns the span to remove, or `null` if none is complete yet.
+   * Finds the closing fence in `this.buf`, scanning only the new tail (plus a
+   * small overlap) since the last call so total work stays linear. Returns the
+   * span to remove, or `null` if none is complete yet.
    */
-  private matchCloseFence(
-    text: string,
-    ticks: number,
-  ): { start: number; end: number } | null {
-    const re = new RegExp(`(^|\\n)[ \\t]*\`{${ticks},}[ \\t]*\\r?\\n`, "g");
-    const m = re.exec(text);
-    if (!m) return null;
+  private matchCloseFence(): { start: number; end: number } | null {
+    const re = this.closeRe!;
+    // Re-scan a small overlap so a fence split across deltas isn't missed. The
+    // window covers `\n` + ticks + a little slack; a closing fence indented by
+    // more than the slack AND split exactly within that indent could be missed
+    // mid-stream, but flush() then recovers it (its trailing regex allows
+    // indentation), so the call is still emitted — just at end of stream. A
+    // wider rewind (to the last newline) would reintroduce O(n²) on single-line
+    // JSON blocks (no interior newlines), so the bounded window is deliberate.
+    re.lastIndex = Math.max(0, this.toolScanFrom - (this.openTicks + 8));
+    const m = re.exec(this.buf);
+    if (!m) {
+      this.toolScanFrom = this.buf.length;
+      return null;
+    }
     const lead = m[1] === "\n" ? 1 : 0;
     return { start: m.index + lead, end: m.index + m[0].length };
   }

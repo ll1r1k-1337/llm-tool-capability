@@ -101,4 +101,16 @@ describe("ToolCallStreamParser", () => {
     const { count } = run([block]);
     expect(count).toBe(1);
   });
+
+  it("bounds memory on an oversized unterminated tool block", () => {
+    const p = new ToolCallStreamParser({ generateId: seqIds(), maxBufferBytes: 64 });
+    const emitted: ChatCompletionChunkDelta[] = [];
+    emitted.push(...p.push("```tool_call\n"));
+    emitted.push(...p.push("x".repeat(500))); // exceeds cap, no closing fence
+    emitted.push(...p.flush());
+    const content = emitted.map((e) => e.content ?? "").join("");
+    // Degrades to plain text rather than buffering unboundedly / hanging.
+    expect(content).toContain("x");
+    expect(p.toolCallCount).toBe(0);
+  });
 });

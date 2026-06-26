@@ -240,6 +240,25 @@ describe("flattenMessages", () => {
     expect(flat[0]!.content).toBe("hello\nworld");
   });
 
+  it("renders the real tool name when a tool result precedes its assistant message", () => {
+    const flat = flattenMessages(
+      [
+        { role: "tool", tool_call_id: "call_1", content: '{"x":1}' },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            { id: "call_1", type: "function", function: { name: "get_weather", arguments: "{}" } },
+          ],
+        },
+      ],
+      { toolCallTag: "tool_call", toolResultTag: "tool_result" },
+    );
+    const result = flat.find((m) => m.role === "user");
+    expect((result as any).content).toContain("get_weather");
+    expect((result as any).content).not.toContain('"name":"tool"');
+  });
+
   it("preserves array content that contains non-text parts (multimodal)", () => {
     const flat = flattenMessages(
       [

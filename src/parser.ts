@@ -79,6 +79,9 @@ export function extractFencedBlocks(text: string): FencedBlock[] {
 }
 
 /** Best-effort JSON parse with light repair (trailing commas, // and /* comments). */
+/** Max input length eligible for regex-based repair (bounds ReDoS risk). */
+const MAX_REPAIR_LENGTH = 256 * 1024;
+
 export function tryParseJson(raw: string): unknown {
   const trimmed = raw.trim();
   if (!trimmed) return undefined;
@@ -87,6 +90,9 @@ export function tryParseJson(raw: string): unknown {
   } catch {
     // fall through to repair
   }
+  // Valid JSON is handled above; the repair regexes can backtrack quadratically
+  // on adversarial input, so only attempt them on reasonably small strings.
+  if (trimmed.length > MAX_REPAIR_LENGTH) return undefined;
   let repaired = trimmed
     // strip /* ... */ block comments
     .replace(/\/\*[\s\S]*?\*\//g, "")

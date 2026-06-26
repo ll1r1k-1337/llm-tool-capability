@@ -25,13 +25,32 @@ export interface PromptOptions {
 export const DEFAULT_TOOL_CALL_TAG = "tool_call";
 export const DEFAULT_TOOL_RESULT_TAG = "tool_result";
 
+/** Neutralizes backticks/newlines in a tool name so it can't break markdown. */
+function safeName(name: string): string {
+  return name.replace(/[`\r\n]+/g, " ").trim();
+}
+
+/**
+ * Breaks runs of >=3 backticks so a schema value / description can't close the
+ * surrounding code fence. Inserts a zero-width space (U+200B, explicit escape so
+ * a formatter can't silently strip it) between each backtick.
+ */
+function neutralizeFences(s: string): string {
+  return s.replace(/`{3,}/g, (run) => run.split("").join("\u200b"));
+}
+
 /** Renders a single tool as a human/LLM-readable schema block. */
 function renderTool(tool: ChatCompletionTool): string {
   const { name, description, parameters } = tool.function;
-  const lines: string[] = [`### ${name}`];
-  if (description) lines.push(description);
+  const lines: string[] = [`### ${safeName(name)}`];
+  if (description) lines.push(neutralizeFences(description));
   const schema = parameters ?? { type: "object", properties: {} };
-  lines.push("Parameters (JSON Schema):", "```json", JSON.stringify(schema, null, 2), "```");
+  lines.push(
+    "Parameters (JSON Schema):",
+    "```json",
+    neutralizeFences(JSON.stringify(schema, null, 2)),
+    "```",
+  );
   return lines.join("\n");
 }
 
@@ -123,7 +142,7 @@ export function buildToolChoiceInstruction(
     return "\n\nIMPORTANT: You MUST call at least one tool now. Do not answer directly.";
   }
   if (typeof toolChoice === "object" && toolChoice.type === "function") {
-    return `\n\nIMPORTANT: You MUST call the tool \`${toolChoice.function.name}\` now. Do not answer directly and do not call any other tool.`;
+    return `\n\nIMPORTANT: You MUST call the tool \`${safeName(toolChoice.function.name)}\` now. Do not answer directly and do not call any other tool.`;
   }
   return "";
 }

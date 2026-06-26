@@ -72,6 +72,8 @@ export type {
   ChatCompletionChunkDelta,
   ChatCompletionChunkToolCall,
   ChatCompletionCreateParams,
+  ChatCompletionCreateParamsNonStreaming,
+  ChatCompletionCreateParamsStreaming,
   ChatClientLike,
   ToolCapableClient,
 } from "./types.js";
