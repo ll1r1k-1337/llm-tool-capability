@@ -4,6 +4,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import type { ChatCompletion, ChatCompletionChunk, ToolCapableClient } from "./types.js";
 import { wrapToolSupport, type WrapOptions } from "./client.js";
 import { createFetchClient } from "./upstream.js";
+import { UpstreamError } from "./errors.js";
 
 const DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024;
 
@@ -121,7 +122,24 @@ export function createProxyHandler(
 
   return (req, res) => {
     void handle(req, res).catch((err) => {
-      // Never leak internal/upstream error detail to clients — log it instead.
+      // An upstream API error (non-2xx with a body) is the legitimate response
+      // the client needs — relay its status and body verbatim. Reserve the
+      // generic 502 for unexpected failures (bugs, network errors to upstream).
+      if (err instanceof UpstreamError) {
+        console.error(`[llm-tool-proxy] upstream ${err.status}: ${err.body.slice(0, 500)}`);
+        if (res.headersSent) {
+          res.end();
+          return;
+        }
+        const hasBody = err.body.trim().length > 0;
+        res.writeHead(err.status, { "content-type": "application/json" });
+        res.end(
+          hasBody
+            ? err.body
+            : JSON.stringify({ error: { message: err.message, type: "upstream_error" } }),
+        );
+        return;
+      }
       console.error("[llm-tool-proxy] request error:", err);
       sendError(res, 502, "Proxy request failed; see server logs.", "api_error");
     });
@@ -163,11 +181,12 @@ export function createProxyHandler(
       });
       if (!upstreamRes.ok) {
         console.error(`[llm-tool-proxy] upstream /models returned ${upstreamRes.status}`);
-        sendError(res, 502, "Failed to fetch models from upstream.", "api_error");
-        return;
       }
+      // Relay the upstream response (status + body) verbatim — transparent proxy.
       const text = await upstreamRes.text();
-      res.writeHead(200, { "content-type": "application/json" });
+      res.writeHead(upstreamRes.status, {
+        "content-type": upstreamRes.headers.get("content-type") ?? "application/json",
+      });
       res.end(text);
       return;
     }

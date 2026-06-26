@@ -71,8 +71,9 @@ Key flags have env equivalents (`UPSTREAM_BASE_URL`, `PORT`, `PROXY_API_KEY`, â€
 
 > **Security:** the proxy binds to `127.0.0.1` and disables CORS by default.
 > Before exposing it beyond localhost (`--host 0.0.0.0`), set `--api-key` so
-> clients must authenticate. Upstream error details are logged server-side, never
-> returned to clients.
+> clients must authenticate. Upstream API errors (status + body â€” e.g.
+> context-length or rate-limit) are relayed to the client so it can react;
+> unexpected internal failures are masked behind a generic 502 and logged.
 
 Embed the proxy in your own server instead of the CLI:
 

@@ -7,6 +7,20 @@ export class ToolCapabilityError extends Error {
   }
 }
 
+/** Thrown when the upstream endpoint returns a non-2xx HTTP response. */
+export class UpstreamError extends ToolCapabilityError {
+  /** The upstream HTTP status code. */
+  readonly status: number;
+  /** The upstream response body (so a proxy can relay it to the caller). */
+  readonly body: string;
+  constructor(status: number, statusText: string, body: string) {
+    super(`Upstream returned ${status} ${statusText}: ${body.slice(0, 500)}`);
+    this.name = "UpstreamError";
+    this.status = status;
+    this.body = body;
+  }
+}
+
 /** Thrown when the agentic runner hits its iteration ceiling without finishing. */
 export class MaxIterationsError extends ToolCapabilityError {
   readonly iterations: number;

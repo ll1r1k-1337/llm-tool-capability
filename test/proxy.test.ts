@@ -172,18 +172,40 @@ describe("proxy server", () => {
     expect(((await res.json()) as any).data[0].id).toBe("m1");
   });
 
-  it("returns 502 without leaking upstream detail on /models error", async () => {
+  it("relays upstream /models errors (status + body) to the client", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const upstream = vi.fn(async () => new Response("SECRET-UPSTREAM-DETAIL", { status: 500 }));
+    const upstream = vi.fn(async () => new Response(JSON.stringify({ error: "boom" }), { status: 503 }));
     const base = await startProxy(upstream);
     const res = await fetch(`${base}/v1/models`);
-    expect(res.status).toBe(502);
-    expect(await res.text()).not.toContain("SECRET");
+    expect(res.status).toBe(503);
+    expect(((await res.json()) as any).error).toBe("boom");
   });
 
-  it("does not leak upstream error detail to chat clients", async () => {
+  it("relays upstream chat errors (status + body) so clients can react", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const upstream = vi.fn(async () => new Response("Bearer sk-SECRET rejected", { status: 401 }));
+    // Mirrors issue #2: upstream rejects an over-long prompt.
+    const upstream = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ error: "context length exceeded", error_type: "Generation Error" }),
+          { status: 424 },
+        ),
+    );
+    const base = await startProxy(upstream);
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }),
+    });
+    expect(res.status).toBe(424);
+    expect(((await res.json()) as any).error).toBe("context length exceeded");
+  });
+
+  it("masks unexpected (non-HTTP) failures behind a generic 502", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const upstream = vi.fn(async () => {
+      throw new Error("CONNECTION-INTERNALS-secret");
+    });
     const base = await startProxy(upstream);
     const res = await fetch(`${base}/v1/chat/completions`, {
       method: "POST",
@@ -191,7 +213,7 @@ describe("proxy server", () => {
       body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }),
     });
     expect(res.status).toBe(502);
-    expect(await res.text()).not.toContain("SECRET");
+    expect(await res.text()).not.toContain("INTERNALS");
   });
 
   it("passes through legacy /v1/completions to the upstream", async () => {

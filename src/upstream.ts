@@ -3,7 +3,7 @@ import type {
   ChatCompletion,
   ChatCompletionChunk,
 } from "./types.js";
-import { ToolCapabilityError } from "./errors.js";
+import { ToolCapabilityError, UpstreamError } from "./errors.js";
 
 export interface FetchClientOptions {
   /** Base URL of the OpenAI-compatible endpoint, e.g. `http://localhost:11434/v1`. */
@@ -87,9 +87,7 @@ export function createFetchClient(options: FetchClientOptions): ChatClientLike {
           });
           if (!response.ok) {
             const text = await response.text().catch(() => "");
-            throw new ToolCapabilityError(
-              `Upstream returned ${response.status} ${response.statusText}: ${text.slice(0, 500)}`,
-            );
+            throw new UpstreamError(response.status, response.statusText, text);
           }
           if (body?.stream) {
             return parseSSE(response);
