@@ -9,3 +9,7 @@ coverage
 # scratch / debug logs
 scratch*
 *.log.jsonl
+
+# stray audit/debug scripts at repo root
+test_*.mjs
+test_*.js
