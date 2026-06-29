@@ -1,4 +1,4 @@
-import type { ChatCompletionMessageToolCall } from "./types.js";
+import type { ChatCompletionMessageToolCall, ChatCompletionTool } from "./types.js";
 import { DEFAULT_TOOL_CALL_TAG } from "./prompt.js";
 
 export interface ParseOptions {
@@ -12,6 +12,14 @@ export interface ParseOptions {
    * Default: `true`.
    */
   lenientFences?: boolean;
+  /**
+   * Also parse native XML-style tool tags — an own-line `<toolName>…</toolName>`
+   * block whose tag matches one of {@link ParseOptions.tools} — into tool calls.
+   * Off by default (would risk false positives on models that don't use it).
+   */
+  xmlToolCalls?: boolean;
+  /** Tool definitions, used to scope and map XML tags. Required for `xmlToolCalls`. */
+  tools?: ChatCompletionTool[];
 }
 
 export interface ParseResult {
@@ -36,6 +44,115 @@ export function randomToolCallId(): string {
     suffix += ID_ALPHABET[Math.floor(Math.random() * ID_ALPHABET.length)];
   }
   return `call_${suffix}`;
+}
+
+/** Escapes a string for safe interpolation into a RegExp source. */
+export function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export const DEFAULT_REASONING_TAG = "think";
+
+export interface ExtractReasoningOptions {
+  /** Tag whose contents are reasoning. Default: `think`. */
+  reasoningTag?: string;
+}
+
+export interface ReasoningResult {
+  /** Concatenated reasoning text, or `null` if no reasoning block was found. */
+  reasoning: string | null;
+  /** The input with every reasoning block removed (and trimmed). */
+  content: string;
+}
+
+/**
+ * Splits `<think>…</think>` reasoning blocks out of a model's text, returning
+ * the concatenated reasoning and the remaining content. Only matched open/close
+ * pairs are removed — an unterminated `<think>` is left untouched, so a
+ * forgotten closing tag can never swallow a tool call or the whole answer. Tag
+ * matching is case-sensitive (matching the streaming `ReasoningStreamParser`).
+ *
+ * Implemented with `indexOf` (not a lazy regex) so work stays linear in the
+ * input length — a `<think>`-heavy input with no closers can't backtrack.
+ */
+export function extractReasoning(
+  text: string,
+  options: ExtractReasoningOptions = {},
+): ReasoningResult {
+  const tag = options.reasoningTag ?? DEFAULT_REASONING_TAG;
+  const open = `<${tag}>`;
+  const close = `</${tag}>`;
+  const reasoning: string[] = [];
+  let content = "";
+  let pos = 0;
+  for (;;) {
+    const start = text.indexOf(open, pos);
+    if (start === -1) break;
+    const end = text.indexOf(close, start + open.length);
+    if (end === -1) break; // unterminated: leave the rest (incl. the open tag) intact
+    content += text.slice(pos, start);
+    const inner = text.slice(start + open.length, end).trim();
+    if (inner.length > 0) reasoning.push(inner);
+    pos = end + close.length;
+  }
+  if (pos === 0) return { reasoning: null, content: text };
+  content += text.slice(pos);
+  return {
+    reasoning: reasoning.length > 0 ? reasoning.join("\n\n") : null,
+    content: content.trim(),
+  };
+}
+
+/**
+ * Determines which single parameter an XML tag's bare (non-object) payload maps
+ * to: the sole required parameter, else the sole parameter. Returns `null` when
+ * the mapping is ambiguous (zero or several candidates).
+ */
+function targetXmlParam(tool: ChatCompletionTool | undefined): string | null {
+  const schema = tool?.function.parameters as Record<string, unknown> | undefined;
+  if (!schema || typeof schema !== "object") return null;
+  const required = schema.required;
+  if (Array.isArray(required) && required.length === 1 && typeof required[0] === "string") {
+    return required[0];
+  }
+  const props = schema.properties;
+  if (props && typeof props === "object") {
+    const keys = Object.keys(props as Record<string, unknown>);
+    if (keys.length === 1) return keys[0]!;
+  }
+  return null;
+}
+
+/**
+ * Maps a native XML tool tag (`<name>inner</name>`) to a tool call. The tag name
+ * is the tool; the inner payload becomes the arguments:
+ * - a JSON **object** is taken as the arguments object directly (a `{name,
+ *   arguments}` envelope is unwrapped);
+ * - a JSON **array/scalar** or non-JSON text is wrapped as the tool's single
+ *   target parameter (e.g. `<question>[…]</question>` → `{ "questions": […] }`).
+ *
+ * Returns `null` when the payload can't be mapped (ambiguous multi-param tool).
+ */
+export function mapXmlToolCall(
+  name: string,
+  inner: string,
+  tool: ChatCompletionTool | undefined,
+): { name: string; arguments: string } | null {
+  const parsed = tryParseJson(inner);
+  if (parsed != null && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const obj = parsed as Record<string, unknown>;
+    if (typeof obj.name === "string" && ("arguments" in obj || "parameters" in obj)) {
+      const na = extractNameArgs(obj);
+      if (na) return { name, arguments: na.arguments };
+    }
+    return { name, arguments: JSON.stringify(parsed) };
+  }
+  const trimmed = inner.trim();
+  if (trimmed === "") return { name, arguments: "{}" };
+  const param = targetXmlParam(tool);
+  if (!param) return null;
+  const value = parsed === undefined ? trimmed : parsed;
+  return { name, arguments: JSON.stringify({ [param]: value }) };
 }
 
 /**
@@ -202,6 +319,54 @@ export function parseToolCalls(text: string, options: ParseOptions = {}): ParseR
       if (calls.length > 0) {
         toolCalls.push(...calls);
         removedSpans.push([block.start, block.end]);
+      }
+    }
+  }
+
+  // Pass 3 (opt-in): native XML tool tags `<name>…</name>` (own-line), scoped to
+  // the provided tool names and skipped inside fenced code blocks. Walked
+  // line-by-line (not one lazy regex) so work stays linear in the input length —
+  // a `<name>`-heavy input with no closers can't trigger quadratic backtracking.
+  if (options.xmlToolCalls && options.tools && options.tools.length > 0) {
+    const toolByName = new Map(options.tools.map((t) => [t.function.name, t]));
+    const names = [...toolByName.keys()].filter((n) => n.length > 0);
+    if (names.length > 0) {
+      const alt = names.map(escapeRegExp).join("|");
+      const openLineRe = new RegExp(`^[ \\t]*<(${alt})>[ \\t]*\\r?$`);
+      const closeLineRe = new RegExp(`^[ \\t]*<\\/(${alt})>[ \\t]*\\r?$`);
+      let pendingName: string | null = null;
+      let blockStart = 0;
+      let innerStart = 0;
+      let pos = 0;
+      for (;;) {
+        const nl = text.indexOf("\n", pos);
+        const lineEnd = nl === -1 ? text.length : nl;
+        const line = text.slice(pos, lineEnd);
+        if (pendingName === null) {
+          const m = openLineRe.exec(line);
+          // Skip openers that fall inside a fenced code block (false positives).
+          if (m && !blocks.some((b) => pos < b.end && b.start < lineEnd)) {
+            pendingName = m[1]!;
+            blockStart = pos;
+            innerStart = nl === -1 ? text.length : nl + 1;
+          }
+        } else {
+          const cm = closeLineRe.exec(line);
+          if (cm && cm[1] === pendingName) {
+            const na = mapXmlToolCall(
+              pendingName,
+              text.slice(innerStart, pos),
+              toolByName.get(pendingName),
+            );
+            if (na) {
+              toolCalls.push({ id: generateId(toolCalls.length), type: "function", function: na });
+              removedSpans.push([blockStart, lineEnd]);
+            }
+            pendingName = null;
+          }
+        }
+        if (nl === -1) break;
+        pos = nl + 1;
       }
     }
   }
