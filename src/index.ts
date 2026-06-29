@@ -33,12 +33,21 @@ export {
   extractFencedBlocks,
   tryParseJson,
   randomToolCallId,
+  extractReasoning,
+  mapXmlToolCall,
+  escapeRegExp,
+  DEFAULT_REASONING_TAG,
   type ParseOptions,
   type ParseResult,
+  type ExtractReasoningOptions,
+  type ReasoningResult,
 } from "./parser.js";
 export {
   ToolCallStreamParser,
+  ReasoningStreamParser,
   type StreamParserOptions,
+  type ReasoningStreamOptions,
+  type ReasoningSplit,
 } from "./stream-parser.js";
 export {
   ToolValidator,

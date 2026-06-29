@@ -65,13 +65,15 @@ tool calls back, and streams via SSE — identical wire format to OpenAI.
 
 **CLI flags:** `--upstream <url>` (required), `--upstream-key`, `--port`,
 `--host`, `--api-key` (require a bearer token from clients), `--base-path`,
-`--tag`, `--no-examples`, `--system-injection merge|prepend`, `--cors` (enable
-wildcard CORS — off by default), `--max-body-size <bytes>` (default 10 MiB),
-`--log-file <path>` (append a JSON-lines debug log of the client request, the
-transformed upstream request, and the response — verbose; bodies are logged but
-headers/tokens never are), `--max-log-size <bytes>` (cap the log file; default
-100 MiB). Key flags have env equivalents (`UPSTREAM_BASE_URL`, `PORT`,
-`PROXY_API_KEY`, `PROXY_LOG_FILE`, …).
+`--tag`, `--no-examples`, `--system-injection merge|prepend`, `--xml-tool-calls`
+(also parse native `<toolName>…</toolName>` tags — see *Reasoning & native
+formats* below), `--no-reasoning` / `--reasoning-tag <tag>` (control
+`<think>` extraction), `--cors` (enable wildcard CORS — off by default),
+`--max-body-size <bytes>` (default 10 MiB), `--log-file <path>` (append a
+JSON-lines debug log of the client request, the transformed upstream request,
+and the response — verbose; bodies are logged but headers/tokens never are),
+`--max-log-size <bytes>` (cap the log file; default 100 MiB). Key flags have env
+equivalents (`UPSTREAM_BASE_URL`, `PORT`, `PROXY_API_KEY`, `PROXY_LOG_FILE`, …).
 
 > **Security:** the proxy binds to `127.0.0.1` and disables CORS by default.
 > Before exposing it beyond localhost (`--host 0.0.0.0`), set `--api-key` so
@@ -244,6 +246,8 @@ it can correct itself on the next turn. Each is recorded in
 | History | Native `assistant.tool_calls` and `role: "tool"` messages are flattened back into the contract automatically. |
 | Validation | Arguments validated against each tool's JSON Schema via `ajv` (toggle with `validate`). |
 | `tool_choice` | `auto` (default), `required`, `{ function: { name } }`, and `none` are honored via prompt instructions. |
+| Reasoning | `<think>…</think>` is split out of `content` into `reasoning_content` (and an upstream `reasoning_content` field is forwarded); on by default, toggle with `reasoning`. |
+| Native XML calls | Opt-in (`xmlToolCalls`): an own-line `<toolName>…</toolName>` whose tag matches a tool is parsed as a call, for models that emit XML instead of the fence. |
 | Loop safety | `maxIterations` ceiling (default 10); returns `finishReason: "max_iterations"` or throws with `throwOnMaxIterations`. |
 
 ## Options
@@ -255,16 +259,52 @@ it can correct itself on the next turn. Each is recorded in
 - `template` — fully customize the instruction block.
 - `systemInjection` — `"merge"` (append to existing system message, default) or `"prepend"`.
 - `lenientFences` — accept ` ```json `/untagged look-alikes (default `true`).
+- `reasoning` — split `<think>…</think>` into `reasoning_content` (default `true`).
+- `reasoningTag` — the reasoning tag to split (default `think`).
+- `xmlToolCalls` — also parse native `<toolName>…</toolName>` tags as calls (default `false`).
 - `generateId` — custom tool-call id generator.
 
 Runner-only: `tools`, `maxIterations`, `validate`, `throwOnMaxIterations`,
 `onToolCall`, `onToolResult`.
 
+### Reasoning & native formats
+
+Some models (e.g. DeepSeek-R1 variants) emit a `<think>…</think>` reasoning
+block and/or request tools as **XML tags** rather than the ` ```tool_call `
+fence. Two behaviors handle this (in both streaming and non-streaming, and
+through the proxy):
+
+- **Reasoning (`reasoning`, on by default).** `<think>…</think>` is removed from
+  `content` and surfaced as `message.reasoning_content` (streamed as
+  `reasoning_content` deltas). A separate upstream `reasoning_content` field is
+  forwarded as-is. Tag matching is **case-sensitive** (default `think`).
+  - *Non-streaming* only strips matched open/close pairs, so a forgotten
+    `</think>` never swallows the answer (the unterminated tag stays in `content`).
+  - *Streaming* must commit as tokens arrive: once `<think>` is seen, text routes
+    to `reasoning_content` until the matching `</think>` (or end of stream). A
+    model that opens `<think>` and never closes it therefore streams the
+    remainder as reasoning rather than content. In practice R1-style models
+    always close the tag.
+
+- **Native XML tool calls (`xmlToolCalls`, off by default).** When enabled, an
+  **own-line** `<toolName>…</toolName>` block whose tag matches one of the
+  request's tools is parsed into a tool call. The inner payload maps to
+  arguments: a JSON object is used directly; a bare array/scalar (or plain text)
+  is wrapped as the tool's single required parameter — e.g.
+  `<question>[…]</question>` → `{ "questions": […] }`. A block that can't be
+  mapped (a bare value on a multi-parameter tool) is left as `content`, not
+  dropped. It's off by default because an always-on `<tag>` scan risks false
+  positives on models that don't use this format. The non-streaming parser skips
+  tags inside fenced code blocks; the streaming parser is **best-effort** here
+  and may match an own-line `<toolName>` inside a non-`tool_call` code fence, so
+  enable `xmlToolCalls` only for models that actually emit this format.
+
 ## Building blocks
 
 The internals are exported for custom pipelines: `buildToolPrompt`,
 `parseToolCalls`, `ToolCallStreamParser`, `ToolValidator`, `flattenMessages`,
-`extractFencedBlocks`, `tryParseJson`.
+`extractFencedBlocks`, `tryParseJson`, `extractReasoning`, `mapXmlToolCall`,
+`ReasoningStreamParser`.
 
 ## Limitations
 

@@ -100,6 +100,12 @@ export interface ChatCompletionMessage {
   content: string | null;
   refusal: string | null;
   tool_calls?: ChatCompletionMessageToolCall[];
+  /**
+   * Chain-of-thought text, separated from `content`. Populated from a model's
+   * `<think>…</think>` block (or forwarded from an upstream `reasoning_content`
+   * field). Matches the de-facto DeepSeek/OpenAI-compatible reasoning field.
+   */
+  reasoning_content?: string | null;
 }
 
 export type ChatCompletionFinishReason =
@@ -149,6 +155,8 @@ export interface ChatCompletionChunkDelta {
   content?: string | null;
   refusal?: string | null;
   tool_calls?: ChatCompletionChunkToolCall[];
+  /** Streamed chain-of-thought, separated from `content`. See {@link ChatCompletionMessage.reasoning_content}. */
+  reasoning_content?: string | null;
 }
 
 export interface ChatCompletionChunkChoice {

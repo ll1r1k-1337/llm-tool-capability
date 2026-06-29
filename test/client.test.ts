@@ -334,3 +334,161 @@ describe("wrapToolSupport (streaming)", () => {
     expect(content).toBe("ab");
   });
 });
+
+const questionTool: ChatCompletionTool = {
+  type: "function",
+  function: {
+    name: "question",
+    parameters: {
+      type: "object",
+      properties: { questions: { type: "array", items: { type: "object" } } },
+      required: ["questions"],
+    },
+  },
+};
+
+describe("wrapToolSupport — reasoning (<think>) handling, issue #4", () => {
+  it("splits <think> out of content into reasoning_content (non-streaming)", async () => {
+    const client = mockClient([
+      "<think>I should list files</think>\nLet me check.\n" +
+        '```tool_call\n{"name":"get_weather","arguments":{"city":"Paris"}}\n```',
+    ]);
+    const wrapped = wrapToolSupport(client, { generateId: seqIds() });
+    const res = (await wrapped.chat.completions.create({
+      model: "m",
+      messages: userMsg,
+      tools,
+    })) as ChatCompletion;
+
+    const msg = res.choices[0]!.message;
+    expect(msg.reasoning_content).toBe("I should list files");
+    expect(msg.content).not.toContain("<think>");
+    expect(msg.content).toContain("Let me check.");
+    expect(msg.tool_calls).toHaveLength(1);
+  });
+
+  it("streams reasoning as reasoning_content deltas, clean content (streaming)", async () => {
+    const client = mockClient([
+      ["<think>plan", "ning</think>", "Hello ", "world"],
+    ]);
+    const wrapped = wrapToolSupport(client);
+    const stream = (await wrapped.chat.completions.create({
+      model: "m",
+      messages: userMsg,
+      tools,
+      stream: true,
+    })) as AsyncIterable<ChatCompletionChunk>;
+    const chunks = await collect(stream);
+    const content = chunks.map((c) => c.choices[0]?.delta.content ?? "").join("");
+    const reasoning = chunks
+      .map((c) => (c.choices[0]?.delta as any).reasoning_content ?? "")
+      .join("");
+    expect(reasoning).toBe("planning");
+    expect(content).toBe("Hello world");
+    expect(content).not.toContain("<think>");
+  });
+
+  it("streams <think> then a tool_call fence (glob comment scenario)", async () => {
+    const client = mockClient([
+      [
+        "<think>list the files</think>\n",
+        "Let me check.\n",
+        '```tool_call\n{"name":"get_weather","arguments":{"city":"Paris"}}\n```',
+      ],
+    ]);
+    const wrapped = wrapToolSupport(client, { generateId: seqIds() });
+    const stream = (await wrapped.chat.completions.create({
+      model: "m",
+      messages: userMsg,
+      tools,
+      stream: true,
+    })) as AsyncIterable<ChatCompletionChunk>;
+    const chunks = await collect(stream);
+    const content = chunks.map((c) => c.choices[0]?.delta.content ?? "").join("");
+    const reasoning = chunks
+      .map((c) => (c.choices[0]?.delta as any).reasoning_content ?? "")
+      .join("");
+    const toolCalls = chunks.flatMap((c) => c.choices[0]?.delta.tool_calls ?? []);
+    expect(reasoning).toBe("list the files");
+    expect(content).toContain("Let me check.");
+    expect(content).not.toContain("<think>");
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls[0]!.function!.name).toBe("get_weather");
+    expect(chunks[chunks.length - 1]!.choices[0]!.finish_reason).toBe("tool_calls");
+  });
+
+  it("leaves <think> in content when reasoning is disabled", async () => {
+    const client = mockClient(["<think>x</think>answer"]);
+    const wrapped = wrapToolSupport(client, { reasoning: false });
+    const res = (await wrapped.chat.completions.create({
+      model: "m",
+      messages: userMsg,
+      tools,
+    })) as ChatCompletion;
+    expect(res.choices[0]!.message.content).toContain("<think>");
+    expect(res.choices[0]!.message.reasoning_content).toBeUndefined();
+  });
+});
+
+describe("wrapToolSupport — native XML tool calls (opt-in), issue #4", () => {
+  it("turns an own-line <question> block into tool_calls (non-streaming)", async () => {
+    const client = mockClient([
+      "<think>need to clarify</think>\nPlease answer:\n" +
+        "<question>\n[{\"question\":\"frontend or backend?\"}]\n</question>",
+    ]);
+    const wrapped = wrapToolSupport(client, {
+      generateId: seqIds(),
+      xmlToolCalls: true,
+    });
+    const res = (await wrapped.chat.completions.create({
+      model: "m",
+      messages: userMsg,
+      tools: [questionTool],
+    })) as ChatCompletion;
+
+    const msg = res.choices[0]!.message;
+    expect(res.choices[0]!.finish_reason).toBe("tool_calls");
+    expect(msg.reasoning_content).toBe("need to clarify");
+    expect(msg.tool_calls).toHaveLength(1);
+    expect(msg.tool_calls![0]!.function.name).toBe("question");
+    expect(JSON.parse(msg.tool_calls![0]!.function.arguments)).toEqual({
+      questions: [{ question: "frontend or backend?" }],
+    });
+  });
+
+  it("turns an own-line <question> block into a tool_call delta (streaming)", async () => {
+    const client = mockClient([
+      ["<question>\n", "[{\"question\":\"ok?\"}]\n", "</question>\n"],
+    ]);
+    const wrapped = wrapToolSupport(client, {
+      generateId: seqIds(),
+      xmlToolCalls: true,
+    });
+    const stream = (await wrapped.chat.completions.create({
+      model: "m",
+      messages: userMsg,
+      tools: [questionTool],
+      stream: true,
+    })) as AsyncIterable<ChatCompletionChunk>;
+    const chunks = await collect(stream);
+    const toolCalls = chunks.flatMap((c) => c.choices[0]?.delta.tool_calls ?? []);
+    const finish = chunks[chunks.length - 1]!.choices[0]!.finish_reason;
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls[0]!.function!.name).toBe("question");
+    expect(finish).toBe("tool_calls");
+  });
+
+  it("does not parse XML tags by default (opt-in only)", async () => {
+    const client = mockClient([
+      "<question>\n[{\"question\":\"a\"}]\n</question>",
+    ]);
+    const wrapped = wrapToolSupport(client);
+    const res = (await wrapped.chat.completions.create({
+      model: "m",
+      messages: userMsg,
+      tools: [questionTool],
+    })) as ChatCompletion;
+    expect(res.choices[0]!.message.tool_calls).toBeUndefined();
+    expect(res.choices[0]!.message.content).toContain("<question>");
+  });
+});

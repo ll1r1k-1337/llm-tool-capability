@@ -9,6 +9,7 @@ import type {
   ChatCompletionMessage,
   ChatCompletionMessageParam,
   ChatCompletionContentPart,
+  ChatCompletionTool,
   ToolCapableClient,
 } from "./types.js";
 import {
@@ -18,8 +19,8 @@ import {
   DEFAULT_TOOL_RESULT_TAG,
   type PromptOptions,
 } from "./prompt.js";
-import { parseToolCalls, tryParseJson } from "./parser.js";
-import { ToolCallStreamParser } from "./stream-parser.js";
+import { parseToolCalls, tryParseJson, extractReasoning } from "./parser.js";
+import { ToolCallStreamParser, ReasoningStreamParser } from "./stream-parser.js";
 import { ToolCapabilityError } from "./errors.js";
 
 export interface WrapOptions extends PromptOptions {
@@ -33,6 +34,22 @@ export interface WrapOptions extends PromptOptions {
    * inserts a fresh system message at the front. Default: `"merge"`.
    */
   systemInjection?: "merge" | "prepend";
+  /**
+   * Split a model's `<think>…</think>` reasoning out of `content` into the
+   * `reasoning_content` field (an upstream `reasoning_content` field is forwarded
+   * too). Applies to tool-enabled requests. Default: `true`.
+   */
+  reasoning?: boolean;
+  /** Tag whose contents are treated as reasoning. Default: `think`. */
+  reasoningTag?: string;
+  /**
+   * Also parse native XML-style tool tags — an own-line `<toolName>…</toolName>`
+   * block whose tag matches a passed-in tool — into tool calls. Off by default;
+   * enable for models (e.g. some R1 variants) that emit calls as XML instead of
+   * the ` ```tool_call ` fence. In streaming mode this is best-effort and does
+   * not guard against tags inside foreign code fences. Default: `false`.
+   */
+  xmlToolCalls?: boolean;
 }
 
 /** Extracts plain text from string-or-content-part-array message content. */
@@ -204,25 +221,54 @@ function injectSystemPrompt(
   return copy;
 }
 
+interface TransformOptions {
+  toolCallTag: string;
+  generateId?: (i: number) => string;
+  lenientFences: boolean;
+  reasoning: boolean;
+  reasoningTag?: string;
+  xmlToolCalls: boolean;
+  tools?: ChatCompletionTool[];
+}
+
 /** Builds a synthetic non-streamed response from the model's raw text. */
-function transformResponse(
-  res: ChatCompletion,
-  opts: { toolCallTag: string; generateId?: (i: number) => string; lenientFences: boolean },
-): ChatCompletion {
+function transformResponse(res: ChatCompletion, opts: TransformOptions): ChatCompletion {
   const choices = res.choices.map((choice) => {
     const raw = choice.message?.content;
     if (typeof raw !== "string") return choice;
-    const { content, toolCalls } = parseToolCalls(raw, {
+
+    let working = raw;
+    let reasoning: string | null = null;
+    if (opts.reasoning) {
+      const r = extractReasoning(working, { reasoningTag: opts.reasoningTag });
+      reasoning = r.reasoning;
+      working = r.content;
+    }
+
+    const { content, toolCalls } = parseToolCalls(working, {
       toolCallTag: opts.toolCallTag,
       generateId: opts.generateId,
       lenientFences: opts.lenientFences,
+      xmlToolCalls: opts.xmlToolCalls,
+      tools: opts.tools,
     });
+
+    // Forward an upstream-provided reasoning_content field if we didn't extract one.
+    const upstreamReasoning = (choice.message as { reasoning_content?: unknown })
+      .reasoning_content;
+    const finalReasoning =
+      reasoning ?? (typeof upstreamReasoning === "string" ? upstreamReasoning : null);
+
     const message: ChatCompletionMessage = {
       role: "assistant",
-      content: toolCalls.length > 0 ? content : (content ?? raw),
+      content:
+        toolCalls.length > 0
+          ? content
+          : (content ?? (reasoning != null ? null : raw)),
       refusal: choice.message.refusal ?? null,
     };
     if (toolCalls.length > 0) message.tool_calls = toolCalls;
+    if (finalReasoning != null) message.reasoning_content = finalReasoning;
     return {
       ...choice,
       message,
@@ -250,12 +296,17 @@ function makeChunk(
 
 async function* transformStream(
   source: AsyncIterable<ChatCompletionChunk>,
-  opts: { toolCallTag: string; generateId?: (i: number) => string },
+  opts: TransformOptions,
 ): AsyncIterable<ChatCompletionChunk> {
   const parser = new ToolCallStreamParser({
     toolCallTag: opts.toolCallTag,
     generateId: opts.generateId,
+    xmlToolCalls: opts.xmlToolCalls,
+    tools: opts.tools,
   });
+  const reasoner = opts.reasoning
+    ? new ReasoningStreamParser({ reasoningTag: opts.reasoningTag })
+    : null;
   let template: ChatCompletionChunk | undefined;
   let started = false;
 
@@ -266,15 +317,32 @@ async function* transformStream(
       started = true;
     }
     const delta = chunk.choices?.[0]?.delta;
+    // Forward an upstream-provided separate reasoning_content field untouched.
+    const upstreamReasoning = (delta as { reasoning_content?: unknown } | undefined)
+      ?.reasoning_content;
+    if (typeof upstreamReasoning === "string" && upstreamReasoning.length > 0) {
+      yield makeChunk(chunk, { reasoning_content: upstreamReasoning });
+    }
     const text = delta?.content;
     if (typeof text === "string" && text.length > 0) {
-      for (const d of parser.push(text)) yield makeChunk(chunk, d);
+      if (reasoner) {
+        const r = reasoner.push(text);
+        if (r.reasoning.length > 0) yield makeChunk(chunk, { reasoning_content: r.reasoning });
+        for (const d of parser.push(r.content)) yield makeChunk(chunk, d);
+      } else {
+        for (const d of parser.push(text)) yield makeChunk(chunk, d);
+      }
     }
   }
 
   if (!started) {
     // Empty upstream — still emit a well-formed role + stop pair.
     yield makeChunk(template, { role: "assistant" });
+  }
+  if (reasoner) {
+    const r = reasoner.flush();
+    if (r.reasoning.length > 0) yield makeChunk(template, { reasoning_content: r.reasoning });
+    for (const d of parser.push(r.content)) yield makeChunk(template, d);
   }
   for (const d of parser.flush()) yield makeChunk(template, d);
   yield makeChunk(
@@ -300,6 +368,9 @@ export function wrapToolSupport(
   const toolResultTag = options.toolResultTag ?? DEFAULT_TOOL_RESULT_TAG;
   const lenientFences = options.lenientFences ?? true;
   const systemInjection = options.systemInjection ?? "merge";
+  const reasoning = options.reasoning ?? true;
+  const reasoningTag = options.reasoningTag;
+  const xmlToolCalls = options.xmlToolCalls ?? false;
 
   const promptOptions: PromptOptions = {
     toolCallTag,
@@ -351,13 +422,23 @@ export function wrapToolSupport(
       ...(stream !== undefined ? { stream } : {}),
     };
 
+    const transformOpts: TransformOptions = {
+      toolCallTag,
+      generateId: options.generateId,
+      lenientFences,
+      reasoning,
+      reasoningTag,
+      xmlToolCalls,
+      tools,
+    };
+
     if (stream) {
       const source = (await client.chat.completions.create(
         outBound,
         requestOptions,
       )) as AsyncIterable<ChatCompletionChunk>;
       if (!useTools) return source;
-      return transformStream(source, { toolCallTag, generateId: options.generateId });
+      return transformStream(source, transformOpts);
     }
 
     const res = (await client.chat.completions.create(
@@ -365,11 +446,7 @@ export function wrapToolSupport(
       requestOptions,
     )) as ChatCompletion;
     if (!useTools) return res;
-    return transformResponse(res, {
-      toolCallTag,
-      generateId: options.generateId,
-      lenientFences,
-    });
+    return transformResponse(res, transformOpts);
   }
 
   return { chat: { completions: { create } } };

@@ -42,6 +42,12 @@ Options:
   --tag <label>           Tool-call fence label (default: tool_call)
   --no-examples           Omit the few-shot example from the injected prompt
   --system-injection <m>  'merge' (default) or 'prepend'
+  --xml-tool-calls        Also parse native XML tool tags (<toolName>…</toolName>)
+                          into tool calls — for models that emit calls as XML
+                          instead of the tool_call fence (off by default)
+  --no-reasoning          Don't split <think>…</think> into reasoning_content
+                          (reasoning extraction is on by default)
+  --reasoning-tag <tag>   Reasoning tag to split out (default: think)
   --cors                  Enable permissive (wildcard) CORS headers (off by default)
   --max-body-size <bytes> Max request body size (default: 10485760 = 10 MiB)
   --log-file <path>       Append a JSON-lines debug log (client request, the
@@ -82,6 +88,9 @@ function main(): void {
     includeExamples: args.examples === false ? false : undefined,
     systemInjection:
       args["system-injection"] === "prepend" ? "prepend" : undefined,
+    xmlToolCalls: args["xml-tool-calls"] === true ? true : undefined,
+    reasoning: args.reasoning === false ? false : undefined,
+    reasoningTag: (args["reasoning-tag"] as string) || undefined,
     cors: args.cors === true ? true : undefined,
     maxBodySize: args["max-body-size"]
       ? Number(args["max-body-size"])

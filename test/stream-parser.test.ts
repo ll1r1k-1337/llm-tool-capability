@@ -1,9 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { ToolCallStreamParser } from "../src/index.js";
-import type { ChatCompletionChunkDelta } from "../src/index.js";
+import { ToolCallStreamParser, ReasoningStreamParser } from "../src/index.js";
+import type {
+  ChatCompletionChunkDelta,
+  ChatCompletionTool,
+  StreamParserOptions,
+} from "../src/index.js";
 import { seqIds } from "./helpers.js";
 
-function run(deltas: string[], options: { toolCallTag?: string } = {}) {
+function run(deltas: string[], options: Partial<StreamParserOptions> = {}) {
   const p = new ToolCallStreamParser({ generateId: seqIds(), ...options });
   const emitted: ChatCompletionChunkDelta[] = [];
   for (const d of deltas) emitted.push(...p.push(d));
@@ -13,7 +17,50 @@ function run(deltas: string[], options: { toolCallTag?: string } = {}) {
   return { content, toolCalls, emitted, count: p.toolCallCount };
 }
 
+function runReasoning(deltas: string[]) {
+  const p = new ReasoningStreamParser();
+  let content = "";
+  let reasoning = "";
+  for (const d of deltas) {
+    const r = p.push(d);
+    content += r.content;
+    reasoning += r.reasoning;
+  }
+  const f = p.flush();
+  content += f.content;
+  reasoning += f.reasoning;
+  return { content, reasoning };
+}
+
 const block = '```tool_call\n{"name":"get_weather","arguments":{"city":"Paris"}}\n```';
+
+const questionTool: ChatCompletionTool = {
+  type: "function",
+  function: {
+    name: "question",
+    parameters: {
+      type: "object",
+      properties: { questions: { type: "array", items: { type: "object" } } },
+      required: ["questions"],
+    },
+  },
+};
+
+const editTool: ChatCompletionTool = {
+  type: "function",
+  function: {
+    name: "edit",
+    parameters: {
+      type: "object",
+      properties: {
+        filePath: { type: "string" },
+        oldString: { type: "string" },
+        newString: { type: "string" },
+      },
+      required: ["filePath", "oldString", "newString"],
+    },
+  },
+};
 
 describe("ToolCallStreamParser", () => {
   it("parses a single block fed in one push", () => {
@@ -112,5 +159,130 @@ describe("ToolCallStreamParser", () => {
     // Degrades to plain text rather than buffering unboundedly / hanging.
     expect(content).toContain("x");
     expect(p.toolCallCount).toBe(0);
+  });
+});
+
+describe("ToolCallStreamParser — native XML tags (opt-in)", () => {
+  const xmlOpts = { xmlToolCalls: true, tools: [questionTool, editTool] };
+
+  it("parses an own-line <question> block in one push", () => {
+    const text = "<question>\n[{\"question\":\"a\"}]\n</question>";
+    const { toolCalls, content } = run([text], xmlOpts);
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls[0]!.function!.name).toBe("question");
+    expect(JSON.parse(toolCalls[0]!.function!.arguments!)).toEqual({
+      questions: [{ question: "a" }],
+    });
+    expect(content).toBe("");
+  });
+
+  it("produces the same result fed character by character", () => {
+    const text = "Sure.\n<question>\n[{\"question\":\"a\"}]\n</question>\n";
+    const { toolCalls, content } = run(text.split(""), xmlOpts);
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls[0]!.function!.name).toBe("question");
+    expect(content).toContain("Sure.");
+  });
+
+  it("handles the opening tag split across deltas", () => {
+    const { toolCalls } = run(
+      ["<que", "stion>\n", "[{\"question\":\"a\"}]\n", "</question>\n"],
+      xmlOpts,
+    );
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls[0]!.function!.name).toBe("question");
+  });
+
+  it("does not treat XML tags as calls when xmlToolCalls is off", () => {
+    const text = "<question>\n[{\"question\":\"a\"}]\n</question>";
+    const { toolCalls, content } = run([text]);
+    expect(toolCalls).toEqual([]);
+    expect(content).toContain("<question>");
+  });
+
+  it("leaves a same-line <question> mention as prose (own-line only)", () => {
+    const { toolCalls, content } = run(["use the <question> tool wisely\n"], xmlOpts);
+    expect(toolCalls).toEqual([]);
+    expect(content).toContain("<question>");
+  });
+
+  it("does not match an unknown tag name", () => {
+    const { toolCalls, content } = run(["<unknown>\nhi\n</unknown>\n"], xmlOpts);
+    expect(toolCalls).toEqual([]);
+    expect(content).toContain("<unknown>");
+  });
+
+  it("best-effort parses an unterminated XML block at flush", () => {
+    const { toolCalls } = run(["<question>\n[{\"question\":\"a\"}]\n"], xmlOpts);
+    expect(toolCalls).toHaveLength(1);
+    expect(JSON.parse(toolCalls[0]!.function!.arguments!)).toEqual({
+      questions: [{ question: "a" }],
+    });
+  });
+
+  it("keeps an unmappable XML block as content instead of dropping it", () => {
+    // A bare value on a multi-param tool can't be mapped — must not be lost.
+    const { toolCalls, content } = run(["<edit>\nbare text\n</edit>\n"], xmlOpts);
+    expect(toolCalls).toEqual([]);
+    expect(content).toContain("<edit>");
+    expect(content).toContain("bare text");
+    expect(content).toContain("</edit>");
+  });
+});
+
+describe("ReasoningStreamParser", () => {
+  it("routes <think> content to reasoning and the rest to content", () => {
+    const { content, reasoning } = runReasoning([
+      "<think>planning</think>",
+      "the answer",
+    ]);
+    expect(reasoning).toBe("planning");
+    expect(content).toBe("the answer");
+  });
+
+  it("produces the same split fed character by character", () => {
+    const { content, reasoning } = runReasoning(
+      "<think>abc</think>hello".split(""),
+    );
+    expect(reasoning).toBe("abc");
+    expect(content).toBe("hello");
+  });
+
+  it("handles the open marker split across deltas", () => {
+    const { content, reasoning } = runReasoning(["<thi", "nk>r", "</think>c"]);
+    expect(reasoning).toBe("r");
+    expect(content).toBe("c");
+  });
+
+  it("handles the close marker split across deltas", () => {
+    const { content, reasoning } = runReasoning(["<think>r</thi", "nk>c"]);
+    expect(reasoning).toBe("r");
+    expect(content).toBe("c");
+  });
+
+  it("passes through plain text with no reasoning", () => {
+    const { content, reasoning } = runReasoning(["hello ", "world"]);
+    expect(content).toBe("hello world");
+    expect(reasoning).toBe("");
+  });
+
+  it("does not mistake a '<' in prose for a marker", () => {
+    const { content, reasoning } = runReasoning(["a < b and c > d"]);
+    expect(content).toBe("a < b and c > d");
+    expect(reasoning).toBe("");
+  });
+
+  it("matches the <think> tag case-sensitively (parity with extractReasoning)", () => {
+    const { content, reasoning } = runReasoning(["<THINK>x</THINK>answer"]);
+    expect(reasoning).toBe("");
+    expect(content).toBe("<THINK>x</THINK>answer");
+  });
+
+  it("streams an unterminated <think> as reasoning (documented streaming contract)", () => {
+    // Streaming commits as tokens arrive: once <think> opens, text routes to
+    // reasoning until close or end of stream. (Non-streaming would keep it.)
+    const { content, reasoning } = runReasoning(["<think>", "no close here"]);
+    expect(reasoning).toBe("no close here");
+    expect(content).toBe("");
   });
 });
